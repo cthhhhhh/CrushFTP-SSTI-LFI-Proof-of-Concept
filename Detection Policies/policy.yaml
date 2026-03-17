@@ -1,0 +1,21 @@
+apiVersion: security.kubearmor.com/v1
+kind: KubeArmorPolicy
+metadata:
+  name: cve-2024-4040
+  namespace: crushftp
+spec:
+  action: Block
+  file:
+    matchDirectories:
+    - dir: /etc/ssh/
+    matchPaths:
+    - path: /etc/passwd
+    - path: /etc/shadow
+    - path: /var/log/auth.log
+    - path: /var/log/wtmp
+    - path: /var/run/utmp
+  message: Access sensitive files detected
+  selector:
+    matchLabels:
+      app: cve-2024-4040
+  severity: 1
