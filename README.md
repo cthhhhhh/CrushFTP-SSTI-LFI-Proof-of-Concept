@@ -172,62 +172,66 @@ A WAF acts as a reverse proxy that inspects incoming HTTP/S traffic before it re
 
 #### Docker Setup
 
-Add to `docker-compose.yaml`:
+Use `Mitigation 1/docker-compose.yaml`:
 
 ```yaml
-version: '3'
 services:
   crushftp:
     build: .
     expose:
       - "8080"
-    networks:
-      - crushnet
-
-  nginx-waf:
-    image: owasp/modsecurity-crs:nginx
     ports:
-      - "80:80"
-    environment:
-      - BACKEND=http://crushftp:8080
-      - PORT=80
+      - "2222:22"
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "8080:80"
     volumes:
-      - ./nginx/waf.conf:/etc/modsecurity.d/setup.conf
-    networks:
-      - crushnet
+      - ./nginx.conf:/etc/nginx/nginx.conf
     depends_on:
       - crushftp
-
-networks:
-  crushnet:
 ```
+#### NGINX Configuration
 
-#### NGINX ModSecurity Rules
+Use `Mitigation 1/nginx.conf`:
 
-Create `nginx/waf.conf`:
+```nginx
+worker_processes 1;
 
-```apache
-# Enable ModSecurity WAF engine
-SecRuleEngine On
+events {
+    worker_connections 1024;
+}
 
-# Block path traversal in URI (CVE-2024-4040 core pattern)
-SecRule REQUEST_URI "@contains ../" \
-        "id:1001,phase:1,deny,status:403,msg:'Path Traversal Attempt'"
+http {
+    # Enable ModSecurity
+    modsecurity on;
+    modsecurity_rules_file /etc/modsecurity.d/setup.conf;
 
-# Block URL-encoded path traversal
-SecRule REQUEST_URI "@contains %2e%2e" \
-        "id:1002,phase:1,deny,status:403,msg:'Encoded Path Traversal'"
+    upstream crushftp {
+        server crushftp:8080;
+    }
 
-# Block path traversal in cookies
-SecRule REQUEST_HEADERS:Cookie "@contains ../" \
-        "id:1003,phase:1,deny,status:403,msg:'Path Traversal in Cookie'"
+    server {
+        listen 80;
+        server_name localhost;
 
-# Block exploit pattern targeting zip + INCLUDE on WebInterface/function
-SecRule REQUEST_URI "@contains /WebInterface/function/" \
-  "chain,id:1004,phase:1,deny,status:403,msg:'CrushFTP VFS Exploit Attempt'"
-SecRule ARGS:command "@streq zip" \
-  "chain"
-SecRule ARGS:path "@contains INCLUDE"
+        # Proxy all traffic to CrushFTP
+        location / {
+            proxy_pass http://crushftp;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Return 403 for blocked requests
+        error_page 403 /403.html;
+        location = /403.html {
+            return 403 '{"error": "Request blocked by WAF"}';
+        }
+    }
+}
 ```
 
 #### Traffic Flow
@@ -246,34 +250,88 @@ Attacker -> NGINX WAF (port 80) -> blocks malicious -> 403 Forbidden
 
 #### Overview
 
-CVE-2024-4040 is exploitable without authentication. Disabling anonymous access forces all clients to authenticate, eliminating the unauthenticated attack vector entirely.
+CVE-2024-4040 is exploitable without authentication. In this lab, anonymous-style access is blocked at the NGINX layer by requiring an `Authorization` header before proxying sensitive routes to CrushFTP.
 
 #### How It Mitigates CVE-2024-4040
 
-- Exploit scripts like `crushed.py` rely on unauthenticated access - removing anonymous users breaks this flow
-- All file access requests are tied to a verified identity
-- Reduces the attack surface to authenticated users only
+- Exploit scripts like `crushed.py` rely on unauthenticated access; requests without credentials are rejected with `401`
+- Requests to `/WebInterface/` and `/` are denied unless authentication data is present
+- Reduces exposure of vulnerable endpoints to unauthenticated users
 
-#### Implementation in CrushFTP
+#### Docker Setup (Exact from Mitigation 2/docker-compose.yaml)
 
-1. Log in to CrushFTP Web Admin at `http://localhost:8080`
-2. Navigate to User Manager
-3. Locate the anonymous user account
-4. Delete or disable the account
-5. Verify no VFS paths have guest/anonymous permissions
+```yaml
+services:
+  crushftp:
+    build: .
+    expose:
+      - "8080"
+    ports:
+      - "2222:22"
+
+  nginx:
+    image: nginx:latest
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - crushftp
+```
+
+#### NGINX Policy (Exact from Mitigation 2/nginx.conf)
+
+```nginx
+events {}
+http {
+  server {
+    listen 80;
+
+    # Allow static assets unauthenticated
+    location ~* \.(css|js|png|jpg|ico|gif)$ {
+      proxy_pass http://crushftp:8080;
+      proxy_set_header Host $host;
+    }
+
+    # Block unauthenticated access to WebInterface
+    location /WebInterface/ {
+      if ($http_authorization = "") {
+        return 401 "Authentication Required - Anonymous sessions disabled";
+      }
+      proxy_pass http://crushftp:8080;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header Authorization $http_authorization;
+    }
+
+    # Block everything else unauthenticated
+    location / {
+      if ($http_authorization = "") {
+        return 401 "Authentication Required";
+      }
+      proxy_pass http://crushftp:8080;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+    }
+  }
+}
+```
 
 #### Verify via Docker
 
 ```bash
-# Confirm anonymous login is rejected
-curl -v -u "anonymous:" http://localhost:8080/WebInterface/function/?command=getUsername
+# Confirm unauthenticated request is rejected by NGINX
+curl -v http://localhost:8080/WebInterface/function/?command=getUsername
 # Expected: 401 Unauthorized
+
+# Optional: authenticated request should be forwarded
+curl -v -u "admin:admin" http://localhost:8080/WebInterface/function/?command=getUsername
 ```
 
 #### Limitations
 
-- Does not patch the underlying vulnerability - authenticated users may still be at risk if exploit is adapted
-- Organisations requiring public FTP access cannot fully disable anonymous access
+- Does not patch the underlying vulnerability; authenticated users may still be at risk if exploit logic is adapted
+- Enforcement depends on proxy placement and correct header handling in front of CrushFTP
 
 ### Mitigation 3 — Update to CrushFTP Version 11
 
